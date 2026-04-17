@@ -22,9 +22,12 @@ gobooking_cancel.py - 後台取消預約腳本
 
 import argparse
 import asyncio
+import datetime
+import json
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 from playwright.async_api import async_playwright
 
@@ -32,6 +35,28 @@ OWNER_URL = "https://gobooking.tw/owner/signinmyroom.html"
 ORDERS_URL = "https://gobooking.tw/owner/ordercontrol.html"
 OWNER_ACCT = "FionaAibot"
 ORDER_ID_RE = re.compile(r"\b(EY\d{10})\b")
+# === 硬鎖：訂單號嚴格格式 EY + 10 位數字 ===
+ORDER_ID_STRICT_RE = re.compile(r"^EY\d{10}$")
+# === Audit log：每筆 cancel 操作都留證據（事故 2026/04/07 後加固）===
+AUDIT_LOG = Path("/tmp/gobooking_cancel_audit.jsonl")
+
+
+def audit(event: str, **fields) -> None:
+    """寫 audit log（jsonl 格式），永不阻塞主流程
+
+    每個 event 都記錄：時間、事件名、所有相關欄位
+    用途：事故調查、operation review、debug
+    """
+    record = {
+        "ts": datetime.datetime.now().isoformat(),
+        "event": event,
+        **fields,
+    }
+    try:
+        with AUDIT_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # 寫 audit 失敗絕不能阻擋取消流程
 
 
 def get_password() -> str:
@@ -279,7 +304,19 @@ async def run_cancel_by_id(
     dry_run: bool = False,
     headless: bool = True,
 ) -> dict:
-    """用訂單號直接搜尋並取消"""
+    """用訂單號直接搜尋並取消（四道硬鎖版本）
+
+    硬規則（事故 2026/04/07 唐于婷 EY0522604256 誤取消後加固）：
+    ────────────────────────────────────────────
+    Lock 1 [格式]   order_id 必須符合 ^EY\\d{10}$，否則拒絕
+    Lock 2 [唯一]   後台最近列表中 order_id 必須唯一匹配（0 或 >1 都 ABORT）
+    Lock 3 [點擊前] 取消前 re-read 該 row 的 dataset，order_id 必須再次相符
+    Lock 4 [diff]   取消前後 snapshot 全部訂單號，diff 必須 = {target}（不多不少）
+    ────────────────────────────────────────────
+    每個事件都寫 /tmp/gobooking_cancel_audit.jsonl，留 audit trail。
+
+    任一鎖失敗 → 立刻 ABORT，絕不取消任何訂單。
+    """
     password = get_password()
     result: dict = {
         "success": False,
@@ -287,7 +324,30 @@ async def run_cancel_by_id(
         "mode": mode,
         "message": "",
         "screenshot": None,
+        "verified": False,
+        "locks_passed": [],
     }
+
+    # === Lock 1: 格式嚴格 regex 驗證（不需開瀏覽器即可拒絕）===
+    if not ORDER_ID_STRICT_RE.match(order_id):
+        audit(
+            "lock1_format_fail",
+            order_id=order_id,
+            reason="not match ^EY\\d{10}$",
+        )
+        result["message"] = (
+            f"❌ ABORT (Lock1 格式): order_id='{order_id}' 不符 ^EY\\d{{10}}$，拒絕操作"
+        )
+        result["abort_lock"] = "lock1_format"
+        return result
+    result["locks_passed"].append("lock1_format")
+
+    audit(
+        "cancel_start",
+        order_id=order_id,
+        mode=mode,
+        dry_run=dry_run,
+    )
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -297,66 +357,272 @@ async def run_cancel_by_id(
             print("[後台] 登入...")
             await login(page, password)
 
-            print(f"[搜尋] 訂單號={order_id}")
+            print(f"[搜尋] 訂單號={order_id}（四道硬鎖精準匹配）")
             await page.goto(ORDERS_URL, timeout=30000)
             await page.wait_for_timeout(2000)
 
-            search_btn = page.locator(".show-search-btn")
-            if await search_btn.count() > 0:
-                await search_btn.click()
-                await page.wait_for_timeout(500)
-
-            # 用訂單號搜尋（填入 name 欄位）
-            await page.fill("#con-name", order_id)
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(3000)
-
+            # 不送任何搜尋條件，直接列最近訂單再用 order_id 比對
             rows = await get_order_rows(page)
             cancel_count = await page.locator(".cancel-btn").count()
 
             if cancel_count == 0:
-                result["message"] = f"找不到訂單號 {order_id}"
+                audit("no_cancellable_orders", order_id=order_id)
+                result["message"] = f"後台沒有任何可取消訂單"
                 result["screenshot"] = f"/tmp/gobooking_cancel_{order_id}.png"
                 await page.screenshot(path=result["screenshot"])
                 return result
 
-            print(f"\n搜尋結果 {cancel_count} 筆：")
-            for i, row in enumerate(rows[:cancel_count]):
-                order_label = row.get("order_id") or "UNKNOWN"
-                print(f"  [{i}] {order_label} {row['text'][:150]}")
+            # === 取消前 snapshot：全部可取消訂單號 ===
+            pre_cancel_ids = [
+                row.get("order_id")
+                for row in rows[:cancel_count]
+                if row.get("order_id")
+            ]
+            audit(
+                "pre_cancel_snapshot",
+                order_id=order_id,
+                cancel_count=cancel_count,
+                visible_orders=pre_cancel_ids,
+            )
 
-            # 嚴格比對：在搜尋結果中確認指定訂單號存在
-            matched_row = None
-            for row in rows[:cancel_count]:
-                if row.get("order_id") == order_id:
-                    matched_row = row
-                    break
+            # === Lock 2: 唯一匹配（0 個或 >1 個都 ABORT）===
+            matching = [
+                (i, row)
+                for i, row in enumerate(rows[:cancel_count])
+                if row.get("order_id") == order_id
+            ]
 
-            if matched_row is None:
-                print(f"❌ 搜尋結果中找不到訂單號 {order_id}，拒絕取消以防誤刪")
-                result["message"] = f"搜尋結果中找不到訂單號 {order_id}，已中止操作"
-                result["screenshot"] = f"/tmp/gobooking_cancel_{order_id}.png"
+            if len(matching) == 0:
+                audit(
+                    "lock2_not_found",
+                    order_id=order_id,
+                    visible_orders=pre_cancel_ids,
+                )
+                result["message"] = (
+                    f"❌ ABORT (Lock2 唯一匹配): 後台最近 {cancel_count} 筆可取消訂單中"
+                    f"找不到 {order_id}。可能該訂單已不在最近列表（需翻頁）、訂單號錯誤、"
+                    f"或該訂單早已取消。絕不取消其他訂單。"
+                )
+                result["abort_lock"] = "lock2_not_found"
+                result["screenshot"] = f"/tmp/gobooking_cancel_{order_id}_notfound.png"
                 await page.screenshot(path=result["screenshot"])
-                sys.exit(1)
+                print(f"\n[debug] 後台最近 {cancel_count} 筆可取消訂單:")
+                for i, row in enumerate(rows[:cancel_count]):
+                    label = row.get("order_id") or "UNKNOWN"
+                    print(f"  [{i}] {label} {row['text'][:120]}")
+                return result
+
+            if len(matching) > 1:
+                # paranoia：理論上不可能（一個 order_id 只能有一筆）
+                audit(
+                    "lock2_duplicate",
+                    order_id=order_id,
+                    duplicate_count=len(matching),
+                    duplicate_indices=[i for i, _ in matching],
+                )
+                result["message"] = (
+                    f"❌ ABORT (Lock2 重複): 後台同時出現 {len(matching)} 筆 {order_id}（異常）"
+                )
+                result["abort_lock"] = "lock2_duplicate"
+                result["screenshot"] = f"/tmp/gobooking_cancel_{order_id}_dup.png"
+                await page.screenshot(path=result["screenshot"])
+                return result
+
+            target_index, target_row = matching[0]
+            result["locks_passed"].append("lock2_unique")
+            audit(
+                "lock2_pass",
+                order_id=order_id,
+                target_index=target_index,
+            )
+
+            print(f"\n[Lock2 ✅] 唯一匹配 {order_id} → row[{target_index}]")
+            print(f"  {target_row['text'][:150]}")
 
             if dry_run:
+                audit("dry_run_complete", order_id=order_id, target_index=target_index)
                 result["success"] = True
-                result["message"] = "DRY_RUN"
+                result["message"] = f"DRY_RUN: 找到 {order_id}"
                 return result
 
+            # === Lock 3: 點擊取消按鈕前最後一次 re-read，assert 一致 ===
+            fresh_rows = await get_order_rows(page)
+            fresh_count = await page.locator(".cancel-btn").count()
+
+            if target_index >= fresh_count:
+                audit(
+                    "lock3_index_oob",
+                    order_id=order_id,
+                    target_index=target_index,
+                    fresh_count=fresh_count,
+                )
+                result["message"] = (
+                    f"❌ ABORT (Lock3 越界): re-read 後可取消數量變了"
+                    f"（{cancel_count}→{fresh_count}），target_index={target_index} 越界"
+                )
+                result["abort_lock"] = "lock3_index_oob"
+                return result
+
+            fresh_target = fresh_rows[target_index]
+            fresh_order_id = fresh_target.get("order_id")
+            if fresh_order_id != order_id:
+                audit(
+                    "lock3_mismatch",
+                    order_id=order_id,
+                    target_index=target_index,
+                    fresh_order_id=fresh_order_id,
+                )
+                result["message"] = (
+                    f"❌ ABORT (Lock3 不一致): row[{target_index}] 在 re-read 後變成"
+                    f"'{fresh_order_id}'，預期 '{order_id}'。可能列表 reorder，拒絕點擊。"
+                )
+                result["abort_lock"] = "lock3_mismatch"
+                result["screenshot"] = f"/tmp/gobooking_cancel_{order_id}_lock3.png"
+                await page.screenshot(path=result["screenshot"])
+                return result
+
+            result["locks_passed"].append("lock3_recheck")
+            audit("lock3_pass", order_id=order_id, target_index=target_index)
+            print(f"[Lock3 ✅] re-read 確認 row[{target_index}] 仍是 {order_id}")
+
+            # === 點擊取消按鈕 ===
             result["screenshot"] = f"/tmp/gobooking_cancel_{order_id}.png"
-            ok, message, dialog_messages = await do_cancel(page, matched_row["index"], mode)
+            print(f"\n[執行] 模式={mode}，取消訂單 {order_id}（row[{target_index}]）...")
+            audit(
+                "click_cancel",
+                order_id=order_id,
+                target_index=target_index,
+                mode=mode,
+            )
+
+            ok, message, dialog_messages = await do_cancel(page, target_index, mode)
             if not ok:
-                result["message"] = message
+                audit(
+                    "do_cancel_failed",
+                    order_id=order_id,
+                    message=message,
+                )
+                result["message"] = f"取消點擊失敗: {message}"
                 await page.screenshot(path=result["screenshot"])
                 return result
 
             if dialog_messages:
                 print(f"  dialog 已處理: {dialog_messages}")
+                audit(
+                    "dialog_handled",
+                    order_id=order_id,
+                    dialogs=dialog_messages,
+                )
 
-            result["success"] = True
-            result["message"] = f"訂單 {order_id} 取消完成"
+            # === Lock 4: 取消後 snapshot diff（最強硬鎖）===
+            # 重新撈列表，跟 pre_cancel_ids 比 diff
+            # 規則：必須只有 target 從可取消列表消失，多消失或消失的不是 target = critical alert
+            post_cancel_ids = []
+            diff_removed: set = set()
+            diff_added: set = set()
+
+            for attempt in range(3):
+                await page.goto(ORDERS_URL, timeout=30000)
+                await page.wait_for_timeout(3000 if attempt > 0 else 2500)
+                verify_rows = await get_order_rows(page)
+                verify_cancel_count = await page.locator(".cancel-btn").count()
+                post_cancel_ids = [
+                    row.get("order_id")
+                    for row in verify_rows[:verify_cancel_count]
+                    if row.get("order_id")
+                ]
+
+                diff_removed = set(pre_cancel_ids) - set(post_cancel_ids)
+                diff_added = set(post_cancel_ids) - set(pre_cancel_ids)
+
+                if order_id in diff_removed:
+                    break  # target 消失了，可以驗證 diff
+                print(f"  [Lock4 retry {attempt+1}/3] target 還在可取消列表，等 3 秒...")
+
             await page.screenshot(path=result["screenshot"])
+
+            audit(
+                "post_cancel_snapshot",
+                order_id=order_id,
+                pre_count=len(pre_cancel_ids),
+                post_count=len(post_cancel_ids),
+                diff_removed=sorted(diff_removed),
+                diff_added=sorted(diff_added),
+            )
+
+            # === Lock 4 critical 判斷 ===
+            if order_id not in diff_removed:
+                # ⚠️ dialog 確認了，但列表 race condition 沒消失（疑似成功但未驗證）
+                # 但仍要檢查有沒有別的訂單意外消失
+                if len(diff_removed) > 0:
+                    audit(
+                        "lock4_critical_target_not_removed_others_removed",
+                        order_id=order_id,
+                        unexpected_removed=sorted(diff_removed),
+                    )
+                    result["message"] = (
+                        f"❌❌❌ CRITICAL (Lock4): target {order_id} 未消失，"
+                        f"但其他訂單意外消失了 {sorted(diff_removed)}！立刻人工檢查！"
+                    )
+                    result["abort_lock"] = "lock4_critical_collateral"
+                    return result
+                # diff_removed 為空 → race condition，dialog 說成功但列表還沒 refresh
+                audit(
+                    "lock4_race_warning",
+                    order_id=order_id,
+                    note="dialog said success but list shows target still present after 3 retries",
+                )
+                result["message"] = (
+                    f"⚠️ 取消 dialog 已確認（取消成功），但 3 次重試後 {order_id} "
+                    f"仍在可取消列表，且沒有其他訂單意外消失。"
+                    f"很可能是後台 refresh race，但請用 check_court 確認。"
+                )
+                result["success"] = True
+                result["verified"] = False
+                return result
+
+            # target 確實消失了
+            if len(diff_removed) > 1:
+                # ❗ critical：消失了不只 target
+                others = sorted(diff_removed - {order_id})
+                audit(
+                    "lock4_critical_collateral_removed",
+                    order_id=order_id,
+                    target_removed=True,
+                    other_removed=others,
+                )
+                result["message"] = (
+                    f"❌❌❌ CRITICAL (Lock4): target {order_id} 消失了，"
+                    f"但同時還有其他訂單也消失了 {others}！立刻人工檢查！"
+                    f"可能是後台 race，也可能是嚴重 bug。"
+                )
+                result["abort_lock"] = "lock4_critical_collateral"
+                result["pre_snapshot"] = pre_cancel_ids
+                result["post_snapshot"] = post_cancel_ids
+                return result
+
+            if len(diff_added) > 0:
+                # 通常是新訂單在 cancel 期間建立的，audit 但不 abort
+                audit(
+                    "lock4_new_orders_appeared",
+                    order_id=order_id,
+                    new_orders=sorted(diff_added),
+                    note="這通常是新預約進來，不影響取消結果",
+                )
+
+            # ✅ 完美路徑：diff_removed == {target}，diff_added 不影響
+            result["locks_passed"].append("lock4_diff")
+            audit(
+                "cancel_verified",
+                order_id=order_id,
+                diff_removed=[order_id],
+                diff_added=sorted(diff_added),
+            )
+            result["success"] = True
+            result["verified"] = True
+            result["message"] = (
+                f"訂單 {order_id} 取消完成並驗證消失（4 道鎖全通過 ✅）"
+            )
             return result
         finally:
             await browser.close()

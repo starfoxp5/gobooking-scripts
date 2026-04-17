@@ -46,15 +46,39 @@ def _get_gobooking_password() -> str:
         pw = "52640246"
     return pw
 
-BACKEND_ROOM_SETTING_URL = "https://gobooking.tw/owner/v2/room-setting.html"
-
-async def set_booking_window(days: int):
-    """登入後台，將 A 場「預約結束 N 日後無法預約」改為指定天數。"""
+async def set_booking_window(days: int, qrid: str = ""):
+    """直接呼叫 ow_set_time_setting API，將指定場所有方案的 maxday 改為指定天數。
+    必須傳入 qrid，確保只改目標場，不影響其他場。
+    """
+    import json as _json, urllib.request as _urlreq
+    if not qrid:
+        raise ValueError("set_booking_window: 必須傳入 qrid")
     password = _get_gobooking_password()
-    print(f"[後台] 設定預約天數 → {days} 天")
+    print(f"[後台] 設定預約天數 → {days} 天 (qrid={qrid})")
+
+    # 取現有 openinginfo（保留所有原始欄位，只改 maxday）
+    pub_url = f"https://gobooking.tw/energy/get_room_opening?QRID={qrid}"
+    with _urlreq.urlopen(pub_url, timeout=10) as r:
+        room_data = _json.loads(r.read())
+    opening = room_data.get("openinginfo", [])
+    if not opening:
+        raise RuntimeError(f"get_room_opening 回傳空 openinginfo，qrid={qrid}")
+
+    for item in opening:
+        item["maxday"] = str(days)
+        item.pop("appno", None)  # API 不接受 appno
+
+    payload = {
+        "QRID": qrid,
+        "booktype": room_data.get("booktype", "2"),
+        "timeunit": room_data.get("timeunit", "30"),
+        "showpricetype": room_data.get("showpricetype", "0"),
+        "openinginfo": opening,
+    }
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(viewport={"width":1280,"height":900})
+        page = await browser.new_page()
         await page.goto(BACKEND_URL, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(1500)
         await page.fill("input[name='userACCT']", BACKEND_USER)
@@ -63,74 +87,25 @@ async def set_booking_window(days: int):
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
         await page.wait_for_timeout(2000)
 
-        # 直接導航到房型設定頁（避免落地頁差異）
-        await page.goto(BACKEND_ROOM_SETTING_URL, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(2000)
-
-        for tab_text in ["房型設定", "時租定價", "營業資訊"]:
-            try:
-                await page.click(f"text={tab_text}", timeout=3000)
-                await page.wait_for_timeout(800)
-            except:
-                pass
-
-        ok = await page.evaluate(f"""
-            () => {{
-                const inputs = Array.from(document.querySelectorAll('input[type=text],input[type=number],input:not([type])'))
-                    .filter(el => el.offsetParent !== null);
-                const setValue = (el, value) => {{
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
-                    setter.call(el, String(value));
-                    el.dispatchEvent(new Event('input', {{bubbles:true}}));
-                    el.dispatchEvent(new Event('change', {{bubbles:true}}));
-                }};
-
-                let minEl = null;
-                let maxEl = null;
-                for (const el of inputs) {{
-                    const ctx = (el.closest('div,tr,li') || document.body).innerText || '';
-                    if (!minEl && (el.id.startsWith('min-week-') || ctx.includes('可開始預約'))) minEl = el;
-                    if (!maxEl && (el.id.startsWith('max-week-') || ctx.includes('無法預約'))) maxEl = el;
-                }}
-                if (!maxEl) return 'not_found';
-                if (minEl) setValue(minEl, 0);
-                setValue(maxEl, {days});
-                return `ok:min=${{minEl ? minEl.value : 'n/a'}}/max=${{maxEl.value}}`;
+        resp = await page.evaluate(f"""
+            async () => {{
+                const r = await fetch('/owner/ow_set_time_setting', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({_json.dumps(payload)})
+                }});
+                return {{status: r.status, text: await r.text()}};
             }}
         """)
-        if not ok.startswith("ok:"):
-            await browser.close()
-            raise RuntimeError("找不到天數欄位")
-
-        async with page.expect_response(
-            lambda resp: "ow_set_roombasic_info" in resp.url,
-            timeout=10000,
-        ) as save_resp_info:
-            await page.evaluate("""
-                () => {
-                    const btns = Array.from(document.querySelectorAll('button,input[type=submit]'))
-                        .filter(el => el.offsetParent !== null);
-                    for (const b of btns) {
-                        const t = b.innerText || b.value || '';
-                        if (t.includes('儲存') || t.includes('確認') || t.includes('Save')) {
-                            b.click(); return;
-                        }
-                    }
-                }
-            """)
-        save_resp = await save_resp_info.value
-        if save_resp.status != 200:
-            await browser.close()
-            raise RuntimeError(f"儲存失敗，HTTP {save_resp.status}")
-        await page.wait_for_timeout(2000)
-        await page.reload(wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(1500)
         await browser.close()
+
+    if resp["status"] != 200 or "Success" not in resp["text"]:
+        raise RuntimeError(f"ow_set_time_setting 失敗: {resp['status']} {resp['text'][:100]}")
     print(f"[後台] ✅ 天數已設為 {days}")
 
 # ── 預設值 ──────────────────────────────────────────────
 DEFAULTS = {
-    "room":    "A",                       # A 或 B
+    "room":    "",                         # 必填，不可為空（A/B/C/J/K/Q）
     "date":    "",                         # YYYY/MM/DD（必填）
     "start":   "19:00",
     "end":     "22:00",
@@ -184,10 +159,10 @@ async def book(room: str, date: str, start: str, end: str,
                 booking_response["body"] = body[:200]
         page.on("response", on_response)
 
-        # 1. 開頁面
-        await page.goto(url)
-        await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(2000)
+        # 1. 開頁面（bypass cache，確保拿到後台最新天數設定）
+        await page.set_extra_http_headers({"Cache-Control": "no-cache", "Pragma": "no-cache"})
+        await page.goto(url, wait_until="networkidle")
+        await page.wait_for_timeout(3000)  # 多等一秒讓 JS 初始化完成
 
         # 2. 選方案
         await page.select_option("select[name='booking-plan']", value=plan_id)
@@ -209,8 +184,10 @@ async def book(room: str, date: str, start: str, end: str,
             )
             if target_name in nav:
                 break
-            await page.locator('[data-action="next"]').first.click()
-            await page.wait_for_timeout(500)
+            await page.evaluate(
+                "document.querySelector('[data-action=\"next\"]')?.click()"
+            )
+            await page.wait_for_timeout(600)
 
         target_day = date.split("/")[2].lstrip("0")  # "23"
         clicked = await page.evaluate(f"""
@@ -254,25 +231,22 @@ async def book(room: str, date: str, start: str, end: str,
             try:
                 await page.select_option("select[name='start-time']", label=start, timeout=5000)
             except Exception:
-                print(f"[gobooking] ⚠️ 找不到 {start}，改用 JS 選第一個可用時段")
-                await page.evaluate("""
-                    () => {
-                        const sel = document.querySelector("select[name='start-time']");
-                        const first = Array.from(sel.options).find(o => !o.disabled && o.value);
-                        if (first) {
-                            const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value').set;
-                            setter.call(sel, first.value);
-                            sel.dispatchEvent(new Event('change', {bubbles:true}));
-                        }
-                    }
+                # 列出可用時段供診斷
+                available = await page.evaluate("""
+                    () => Array.from(document.querySelector("select[name='start-time']").options)
+                        .filter(o => !o.disabled && o.value)
+                        .map(o => o.label || o.text)
                 """)
+                print(f"[ERROR] 找不到開始時間 {start}，可用時段：{available}")
+                await browser.close()
+                return None
         await page.wait_for_timeout(1500)
         await page.wait_for_function(
             "() => !document.querySelector(\"select[name='end-time']\").disabled",
             timeout=15000
         )
         await page.wait_for_timeout(300)
-        # 若 end="nearest" 或指定時間找不到，自動選第一個可用選項
+        # 若 end="nearest" 自動選第一個可用選項；否則嚴格比對，找不到就報錯停止
         if end.lower() == "nearest":
             await page.evaluate("""
                 () => {
@@ -289,18 +263,14 @@ async def book(room: str, date: str, start: str, end: str,
             try:
                 await page.select_option("select[name='end-time']", label=end, timeout=5000)
             except Exception:
-                print(f"[gobooking] ⚠️ 找不到結束時間 {end}，改選最近可用時段")
-                await page.evaluate("""
-                    () => {
-                        const sel = document.querySelector("select[name='end-time']");
-                        const first = Array.from(sel.options).find(o => !o.disabled && o.value);
-                        if (first) {
-                            const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value').set;
-                            setter.call(sel, first.value);
-                            sel.dispatchEvent(new Event('change', {bubbles:true}));
-                        }
-                    }
+                available = await page.evaluate("""
+                    () => Array.from(document.querySelector("select[name='end-time']").options)
+                        .filter(o => !o.disabled && o.value)
+                        .map(o => o.label || o.text)
                 """)
+                print(f"[ERROR] 找不到結束時間 {end}，可用時段：{available}")
+                await browser.close()
+                return None
         await page.wait_for_timeout(800)
 
         # 5. 點「立即預約」
@@ -477,7 +447,7 @@ async def book(room: str, date: str, start: str, end: str,
 
 def main():
     parser = argparse.ArgumentParser(description="gobooking 自動預約")
-    parser.add_argument("--room",   default=DEFAULTS["room"],   help="A 或 B")
+    parser.add_argument("--room",   default=DEFAULTS["room"],   required=not DEFAULTS["room"],  help="場地代號（A/B/C/J/K/Q）必填")
     parser.add_argument("--date",   default=DEFAULTS["date"],   help="YYYY/MM/DD")
     parser.add_argument("--start",  default=DEFAULTS["start"],  help="開始時間 HH:MM，或填 now 選「即刻 Now」")
     parser.add_argument("--end",    default=DEFAULTS["end"],    help="結束時間 HH:MM")
@@ -491,10 +461,15 @@ def main():
     args = parser.parse_args()
 
     async def run():
-        # 預約前：後台開放 100 天（除非外部已設定）
+        if not args.room:
+            parser.error("--room 必填，請指定場地（A/B/C/J/K/Q）")
+        if args.room.upper() not in ROOM_CONFIG:
+            parser.error(f"--room 無效：{args.room}，必須是 A/B/C/J/K/Q 之一")
+        room_qrid = ROOM_CONFIG.get(args.room.upper(), {}).get("qrid", "")
+        # 預約前：後台開放 100 天（针對該場）
         if not args.dry_run and not args.no_set_days:
             try:
-                await set_booking_window(100)
+                await set_booking_window(100, qrid=room_qrid)
             except Exception as e:
                 print(f"[後台] ⚠️ 無法設定天數（{e}），仍繼續預約")
 
@@ -504,10 +479,10 @@ def main():
             dry_run=args.dry_run, ticket=args.ticket,
         )
 
-        # 預約後：後台改回 30 天（除非外部控制）
+        # 預約後：後台改回 30 天（针對該場）
         if not args.dry_run and not args.no_set_days:
             try:
-                await set_booking_window(30)
+                await set_booking_window(30, qrid=room_qrid)
             except Exception as e:
                 print(f"[後台] ⚠️ 無法還原天數（{e}），請手動改回 30 天！")
 

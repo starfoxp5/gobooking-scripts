@@ -18,6 +18,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Optional
 
 # ── 常數 ─────────────────────────────────────────────────────────────
@@ -27,6 +28,9 @@ CALENDAR_ACCOUNT = "energy.shuttlecock979@gmail.com"
 TELEGRAM_CHAT_ID = "8472011522"
 
 GMAIL_SEARCH_QUERY = "from:justbooking@miezo.com.tw subject:取消預約通知 is:unread"
+AUTH_DEGRADED_PATH = Path(
+    "/Users/openmini/.openclaw/workspace-fiona/logs/gobooking_cancel_sync_auth_degraded.json"
+)
 
 # 全形 ↔ 半形場地代號對照
 FULLWIDTH = "ＡＢＣＪＫＱ"
@@ -42,6 +46,45 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("gobooking_cancel")
+AUTH_DEGRADED = False
+
+
+def _mark_auth_degraded(stage: str, reason: str, error_text: str) -> None:
+    """Persist auth-degraded state so watchdog can report real root cause."""
+    global AUTH_DEGRADED
+    AUTH_DEGRADED = True
+    try:
+        AUTH_DEGRADED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "updated_at": datetime.now().isoformat(),
+            "stage": stage,
+            "reason": reason,
+            "error": error_text[:1000],
+        }
+        AUTH_DEGRADED_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _clear_auth_degraded() -> None:
+    global AUTH_DEGRADED
+    AUTH_DEGRADED = False
+    try:
+        if AUTH_DEGRADED_PATH.exists():
+            AUTH_DEGRADED_PATH.unlink()
+    except Exception:
+        pass
+
+
+def _auth_error_reason(text: str) -> Optional[str]:
+    lowered = text.lower()
+    if "invalid_grant" in lowered:
+        return "invalid_grant"
+    if "no auth for" in lowered:
+        return "no_auth"
+    return None
 
 
 # ── 資料結構 ─────────────────────────────────────────────────────────
@@ -224,8 +267,12 @@ def fetch_unread_cancel_emails() -> list[dict]:
         "-j",
     )
     if result.returncode != 0:
+        err = result.stderr.strip()
+        reason = _auth_error_reason(err)
+        if reason:
+            _mark_auth_degraded("gmail_search", reason, err)
         log.error(
-            "Gmail 搜尋失敗 (rc=%d): %s", result.returncode, result.stderr.strip()
+            "Gmail 搜尋失敗 (rc=%d): %s", result.returncode, err
         )
         return []
 
@@ -262,7 +309,11 @@ def mark_as_read(msg_id: str) -> None:
         GMAIL_ACCOUNT,
     )
     if result.returncode != 0:
-        log.warning("標記已讀失敗 (msg_id=%s): %s", msg_id, result.stderr.strip())
+        err = result.stderr.strip()
+        reason = _auth_error_reason(err)
+        if reason:
+            _mark_auth_degraded("gmail_mark_read", reason, err)
+        log.warning("標記已讀失敗 (msg_id=%s): %s", msg_id, err)
     else:
         log.info("已標記已讀: %s", msg_id)
 
@@ -294,8 +345,12 @@ def find_calendar_event(info: CancelInfo) -> Optional[tuple[str, str]]:
     )
 
     if result.returncode != 0:
+        err = result.stderr.strip()
+        reason = _auth_error_reason(err)
+        if reason:
+            _mark_auth_degraded("calendar_list", reason, err)
         log.error(
-            "Calendar 查詢失敗 (rc=%d): %s", result.returncode, result.stderr.strip()
+            "Calendar 查詢失敗 (rc=%d): %s", result.returncode, err
         )
         return None
 
@@ -433,6 +488,7 @@ def process_message(msg: dict, tg_token: str) -> None:
 # ── 主流程 ───────────────────────────────────────────────────────────
 def main() -> None:
     log.info("=== gobooking_cancel_sync 開始 ===")
+    _clear_auth_degraded()
 
     # 先取 token，失敗就直接結束
     try:
@@ -464,6 +520,20 @@ def main() -> None:
                 mark_as_read(msg_id)
             except Exception:
                 log.error("錯誤恢復也失敗了 (msg_id=%s)", msg_id)
+
+    if AUTH_DEGRADED:
+        reason = "google_oauth_auth_error"
+        try:
+            if AUTH_DEGRADED_PATH.exists():
+                raw = json.loads(AUTH_DEGRADED_PATH.read_text(encoding="utf-8"))
+                if str(raw.get("reason", "")).strip():
+                    reason = f"google_oauth_{raw['reason']}"
+        except Exception:
+            pass
+        log.warning(
+            "STATUS=degraded_auth reason=%s action=reauth_google_client_fiona",
+            reason,
+        )
 
     log.info("=== gobooking_cancel_sync 結束 ===")
 
