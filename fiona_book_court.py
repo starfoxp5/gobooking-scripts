@@ -124,7 +124,7 @@ def main():
         return
 
     # === Mode 2: 預約 ===
-    required = ['room', 'date', 'start', 'end', 'name', 'phone', 'email']
+    required = ['room', 'date', 'start', 'end'] if args.ticket else ['room', 'date', 'start', 'end', 'name', 'phone', 'email']
     missing = [r for r in required if not getattr(args, r)]
     if missing:
         print(json.dumps({
@@ -202,10 +202,13 @@ def main():
             "--date", args.date,
             "--start", args.start,
             "--end", args.end,
-            "--name", args.name,
-            "--phone", args.phone,
-            "--email", args.email,
         ]
+        if args.name:
+            cmd += ["--name", args.name]
+        if args.phone:
+            cmd += ["--phone", args.phone]
+        if args.email:
+            cmd += ["--email", args.email]
         if args.coupon:
             cmd += ["--coupon", args.coupon]
         if args.ticket:

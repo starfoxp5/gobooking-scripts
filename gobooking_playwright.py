@@ -130,9 +130,9 @@ async def book(room: str, date: str, start: str, end: str,
                coupon: str, name: str, phone: str, email: str,
                dry_run: bool = False, ticket: str = ""):
 
-    # 名字後面自動加上標記（若尚未有）
+    # 名字後面自動加上標記（若尚未有，且有名字時才加）
     MARK = "(＾ω＾)"
-    if MARK not in name:
+    if name and MARK not in name:
         name = name + MARK
 
     cfg = ROOM_CONFIG[room.upper()]
@@ -278,16 +278,20 @@ async def book(room: str, date: str, start: str, end: str,
         await page.wait_for_selector("#payment-name", timeout=10000)
 
         # 6. 填付款人資訊
-        await page.locator("#payment-name").fill(name)
-        await page.wait_for_timeout(200)
-        await page.locator("#payment-phone").fill(phone)
-        await page.wait_for_timeout(200)
-        await page.locator("#payment-email").fill(email)
-        await page.wait_for_timeout(200)
-        await page.evaluate(
-            "document.querySelector('label[for=\"same-as-contact\"]')?.click()"
-        )
-        await page.wait_for_timeout(500)
+        if name:
+            await page.locator("#payment-name").fill(name)
+            await page.wait_for_timeout(200)
+        if phone:
+            await page.locator("#payment-phone").fill(phone)
+            await page.wait_for_timeout(200)
+        if email:
+            await page.locator("#payment-email").fill(email)
+            await page.wait_for_timeout(200)
+        if name and phone and email:
+            await page.evaluate(
+                "document.querySelector('label[for=\"same-as-contact\"]')?.click()"
+            )
+            await page.wait_for_timeout(500)
 
         # 7. 套用套票（可與優惠碼同時使用）
         if ticket:
@@ -316,16 +320,6 @@ async def book(room: str, date: str, start: str, end: str,
                 }
             """)
             await page.wait_for_timeout(2000)
-            # Apply 後補填付款人（若系統未自動帶入）
-            payer_name = await page.locator("#payment-name").input_value()
-            if not payer_name.strip():
-                await page.locator("#payment-name").fill(name)
-                await page.locator("#payment-phone").fill(phone)
-                await page.locator("#payment-email").fill(email)
-                await page.evaluate(
-                    "document.querySelector('label[for=\"same-as-contact\"]')?.click()"
-                )
-            await page.wait_for_timeout(500)
 
         # 8. 套用優惠碼（套票後接著用，或單獨使用）
         if coupon and not ticket:
@@ -397,6 +391,13 @@ async def book(room: str, date: str, start: str, end: str,
             return {"dry_run": True, "total": total}
 
         # 8. 直接呼叫 Pinia booking.submitBooking()（繞過 Vue form validation）
+        # 套票模式：從頁面讀付款人欄位值當聯絡人
+        submit_name = name or await page.locator("#payment-name").input_value()
+        submit_phone = phone or await page.locator("#payment-phone").input_value()
+        submit_email = email or await page.locator("#payment-email").input_value()
+        # 從頁面讀到的名字也要加標記
+        if submit_name and MARK not in submit_name:
+            submit_name = submit_name + MARK
         result = await page.evaluate(f"""
             async () => {{
                 try {{
@@ -404,12 +405,12 @@ async def book(room: str, date: str, start: str, end: str,
                     const pinia = app.config.globalProperties.$pinia;
                     const booking = pinia._s.get('booking');
                     booking.$patch({{
-                        paymentName: '{name}',
-                        paymentPhone: '{phone}',
-                        paymentEmail: '{email}',
-                        contactName: '{name}',
-                        contactPhone: '{phone}',
-                        contactEmail: '{email}',
+                        paymentName: '{submit_name}',
+                        paymentPhone: '{submit_phone}',
+                        paymentEmail: '{submit_email}',
+                        contactName: '{submit_name}',
+                        contactPhone: '{submit_phone}',
+                        contactEmail: '{submit_email}',
                         invType: 'member',
                         bookingRemark: '（Fiona^o^）',
                     }});
@@ -452,13 +453,16 @@ def main():
     parser.add_argument("--start",  default=DEFAULTS["start"],  help="開始時間 HH:MM，或填 now 選「即刻 Now」")
     parser.add_argument("--end",    default=DEFAULTS["end"],    help="結束時間 HH:MM")
     parser.add_argument("--coupon", default="", help="優惠碼（不傳則不使用）")
-    parser.add_argument("--name",   required=True,  help="聯絡人姓名（必填）")
-    parser.add_argument("--phone",  required=True,  help="聯絡人電話（必填）")
-    parser.add_argument("--email",  required=True,  help="聯絡人 email（必填）")
+    parser.add_argument("--name",   default="",  help="聯絡人姓名（套票模式可省略）")
+    parser.add_argument("--phone",  default="",  help="聯絡人電話（套票模式可省略）")
+    parser.add_argument("--email",  default="",  help="聯絡人 email（套票模式可省略）")
     parser.add_argument("--ticket", default="",     help="套票代碼（TEY...），帶此參數走套票流程")
     parser.add_argument("--dry-run", action="store_true",       help="只模擬，不送出")
     parser.add_argument("--no-set-days", action="store_true",   help="跳過內部天數設定（批次模式用）")
     args = parser.parse_args()
+
+    if not args.ticket and (not args.name or not args.phone or not args.email):
+        parser.error("非套票模式下 --name, --phone, --email 為必填")
 
     async def run():
         if not args.room:
