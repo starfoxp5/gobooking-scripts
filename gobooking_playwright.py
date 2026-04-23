@@ -398,10 +398,6 @@ async def book(room: str, date: str, start: str, end: str,
                 await page.select_option("select[name='end-time']", label=end, timeout=5000)
             except Exception:
                 raise RuntimeError(f"找不到結束時間 {end}，中止預約。請確認時間格式正確且該時段存在。")
-                if False:
-                    pass
-                    }
-                """)
         await page.wait_for_timeout(800)
 
         # 5. 點「立即預約」
