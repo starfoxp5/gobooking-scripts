@@ -373,18 +373,7 @@ async def book(room: str, date: str, start: str, end: str,
             try:
                 await page.select_option("select[name='start-time']", label=start, timeout=5000)
             except Exception:
-                print(f"[gobooking] ⚠️ 找不到 {start}，改用 JS 選第一個可用時段")
-                await page.evaluate("""
-                    () => {
-                        const sel = document.querySelector("select[name='start-time']");
-                        const first = Array.from(sel.options).find(o => !o.disabled && o.value);
-                        if (first) {
-                            const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value').set;
-                            setter.call(sel, first.value);
-                            sel.dispatchEvent(new Event('change', {bubbles:true}));
-                        }
-                    }
-                """)
+                raise RuntimeError(f"找不到開始時間 {start}，中止預約。請確認時間格式正確且該時段存在。")
         await page.wait_for_timeout(1500)
         await page.wait_for_function(
             "() => !document.querySelector(\"select[name='end-time']\").disabled",
@@ -408,16 +397,9 @@ async def book(room: str, date: str, start: str, end: str,
             try:
                 await page.select_option("select[name='end-time']", label=end, timeout=5000)
             except Exception:
-                print(f"[gobooking] ⚠️ 找不到結束時間 {end}，改選最近可用時段")
-                await page.evaluate("""
-                    () => {
-                        const sel = document.querySelector("select[name='end-time']");
-                        const first = Array.from(sel.options).find(o => !o.disabled && o.value);
-                        if (first) {
-                            const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value').set;
-                            setter.call(sel, first.value);
-                            sel.dispatchEvent(new Event('change', {bubbles:true}));
-                        }
+                raise RuntimeError(f"找不到結束時間 {end}，中止預約。請確認時間格式正確且該時段存在。")
+                if False:
+                    pass
                     }
                 """)
         await page.wait_for_timeout(800)
