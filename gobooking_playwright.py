@@ -128,13 +128,34 @@ async def set_booking_window(days: int):
         await browser.close()
     print(f"[後台] ✅ 天數已設為 {days}")
 
-async def set_min_booking_minutes(minutes: int):
-    """登入後台，將所有場館「最短時租」改為指定分鐘數（30 或 60）。"""
+async def set_min_booking_minutes(minutes: int, rooms: list | None = None):
+    """
+    登入後台，把指定場館（預設全部）的所有方案「最短時租」改為指定分鐘數。
+    minutes=30 → value="1"（0.5小時）
+    minutes=60 → value="2"（1小時）
+    """
+    # select value mapping
+    val = "1" if minutes == 30 else "2"
     password = _get_gobooking_password()
-    print(f"[後台] 設定最短時租 → {minutes} 分鐘")
+
+    # QRID per room（與 ROOM_CONFIG 對應）
+    ROOM_QRIDS = {
+        "A": "170049020310051559",
+        "B": "170050020310063902",
+        "C": "170051020310068898",
+        "J": "170052020310077340",
+        "K": "170188112712121020",
+        "Q": "170187112712110103",
+    }
+    target_rooms = rooms if rooms else list(ROOM_QRIDS.keys())
+
+    print(f"[後台] 設定最短時租 → {minutes} 分鐘，場館：{target_rooms}")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": 1280, "height": 900})
+
+        # 登入一次
         await page.goto(BACKEND_URL, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(1500)
         await page.fill("input[name='userACCT']", BACKEND_USER)
@@ -143,65 +164,87 @@ async def set_min_booking_minutes(minutes: int):
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
         await page.wait_for_timeout(2000)
 
-        await page.goto(BACKEND_ROOM_SETTING_URL, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(2000)
+        for room in target_rooms:
+            qrid = ROOM_QRIDS.get(room.upper())
+            if not qrid:
+                print(f"[後台] ⚠️ 找不到 {room} 場 QRID，跳過")
+                continue
 
-        # 依序點 tab 直到找到最短時租欄位
-        for tab_text in ["房型設定", "時租定價", "營業資訊"]:
+            url = f"https://gobooking.tw/owner/inroomsetting.html?{qrid}"
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
+
+            # 點「營業資訊」tab
             try:
-                await page.click(f"text={tab_text}", timeout=3000)
-                await page.wait_for_timeout(800)
-            except Exception:
-                pass
+                await page.click("text=營業資訊", timeout=5000)
+                await page.wait_for_timeout(1500)
+            except Exception as e:
+                print(f"[後台] ⚠️ {room} 場找不到「營業資訊」tab：{e}")
+                continue
 
-        ok = await page.evaluate(f"""
-            () => {{
-                const inputs = Array.from(document.querySelectorAll('input[type=text],input[type=number],input:not([type])'))
-                    .filter(el => el.offsetParent !== null);
-                const setValue = (el, value) => {{
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
-                    setter.call(el, String(value));
-                    el.dispatchEvent(new Event('input', {{bubbles:true}}));
-                    el.dispatchEvent(new Event('change', {{bubbles:true}}));
-                }};
-                let found = 0;
-                for (const el of inputs) {{
-                    const ctx = (el.closest('div,tr,li,label') || document.body).innerText || '';
-                    if (ctx.includes('最短') || ctx.includes('最小') || ctx.includes('min_book') || ctx.includes('minBook')) {{
-                        setValue(el, {minutes});
-                        found++;
-                    }}
-                }}
-                return found > 0 ? `ok:changed=${{found}}` : 'not_found';
-            }}
-        """)
-        if not ok.startswith("ok:"):
-            await browser.close()
-            raise RuntimeError(f"找不到最短時租欄位（結果：{ok}）")
-
-        async with page.expect_response(
-            lambda resp: "ow_set_roombasic_info" in resp.url,
-            timeout=10000,
-        ) as save_resp_info:
-            await page.evaluate("""
-                () => {
-                    const btns = Array.from(document.querySelectorAll('button,input[type=submit]'))
+            # 找所有「最短時租」select 並改值
+            changed = await page.evaluate(f"""
+                () => {{
+                    const selects = Array.from(document.querySelectorAll("select"))
                         .filter(el => el.offsetParent !== null);
-                    for (const b of btns) {
-                        const t = b.innerText || b.value || '';
-                        if (t.includes('儲存') || t.includes('確認') || t.includes('Save')) {
-                            b.click(); return;
+                    let count = 0;
+                    for (const sel of selects) {{
+                        const label = (sel.closest("div,tr,li,td,label") || document.body).innerText || "";
+                        if (label.includes("最短時租")) {{
+                            const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set;
+                            setter.call(sel, "{val}");
+                            sel.dispatchEvent(new Event("input", {{bubbles: true}}));
+                            sel.dispatchEvent(new Event("change", {{bubbles: true}}));
+                            count++;
+                        }}
+                    }}
+                    return count;
+                }}
+            """)
+            if changed == 0:
+                print(f"[後台] ⚠️ {room} 場找不到最短時租 select")
+                continue
+
+            # 點儲存
+            try:
+                async with page.expect_response(
+                    lambda resp: "inroomsetting" in resp.url or "roomsetting" in resp.url or "ow_set" in resp.url,
+                    timeout=8000,
+                ) as resp_info:
+                    await page.evaluate("""
+                        () => {
+                            const btns = Array.from(document.querySelectorAll("button,input[type=submit]"))
+                                .filter(el => el.offsetParent !== null);
+                            for (const b of btns) {
+                                const t = (b.innerText || b.value || "").trim();
+                                if (t.includes("儲存") || t.includes("Save") || t.includes("確認")) {
+                                    b.click(); return t;
+                                }
+                            }
+                        }
+                    """)
+                await resp_info.value
+            except Exception:
+                # 若攔截不到 XHR，直接點儲存不等
+                await page.evaluate("""
+                    () => {
+                        const btns = Array.from(document.querySelectorAll("button,input[type=submit]"))
+                            .filter(el => el.offsetParent !== null);
+                        for (const b of btns) {
+                            const t = (b.innerText || b.value || "").trim();
+                            if (t.includes("儲存") || t.includes("Save") || t.includes("確認")) {
+                                b.click(); return;
+                            }
                         }
                     }
-                }
-            """)
-        save_resp = await save_resp_info.value
-        if save_resp.status != 200:
-            await browser.close()
-            raise RuntimeError(f"儲存失敗，HTTP {save_resp.status}")
-        await page.wait_for_timeout(1500)
+                """)
+                await page.wait_for_timeout(2000)
+
+            print(f"[後台] ✅ {room} 場最短時租已設為 {minutes} 分鐘（改了 {changed} 個方案）")
+
         await browser.close()
-    print(f"[後台] ✅ 最短時租已設為 {minutes} 分鐘")
+    print(f"[後台] ✅ 全部完成：最短時租 = {minutes} 分鐘")
+
 
 
 # ── 預設值 ──────────────────────────────────────────────
